@@ -129,6 +129,17 @@ std::shared_ptr<SSLContext> newSSLServerContext(const std::string &certPath,
     return ctx;
 }
 }  // namespace trantor
+
+#else
+namespace trantor
+{
+std::shared_ptr<SSLContext> newSSLServerContext(const std::string &certPath,
+                                                const std::string &keyPath)
+{
+    LOG_FATAL << "OpenSSL is not found in your system!";
+    abort();
+}
+}  // namespace trantor
 #endif
 
 TcpConnectionImpl::TcpConnectionImpl(EventLoop *loop,
@@ -159,6 +170,32 @@ TcpConnectionImpl::~TcpConnectionImpl()
 }
 #ifdef USE_OPENSSL
 void TcpConnectionImpl::startClientEncryptionInLoop(
+    std::function<void()> &&callback)
+{
+    loop_->assertInLoopThread();
+    if (isEncrypted_)
+    {
+        LOG_WARN << "This connection is already encrypted";
+        return;
+    }
+    sslEncryptionPtr_ = std::make_unique<SSLEncryption>();
+    sslEncryptionPtr_->upgradeCallback_ = std::move(callback);
+    sslEncryptionPtr_->sslCtxPtr_ = newSSLContext();
+    sslEncryptionPtr_->sslPtr_ =
+        std::make_unique<SSLConn>(sslEncryptionPtr_->sslCtxPtr_->get());
+    isEncrypted_ = true;
+    sslEncryptionPtr_->isUpgrade_ = true;
+    auto r = SSL_set_fd(sslEncryptionPtr_->sslPtr_->get(), socketPtr_->fd());
+    (void)r;
+    assert(r);
+    sslEncryptionPtr_->sendBufferPtr_ =
+        std::make_unique<std::array<char, 8192>>();
+    LOG_TRACE << "connectEstablished";
+    ioChannelPtr_->enableWriting();
+    SSL_set_connect_state(sslEncryptionPtr_->sslPtr_->get());
+}
+void TcpConnectionImpl::startServerEncryptionInLoop(
+    const std::shared_ptr<SSLContext> &ctx,
     std::function<void()> &&callback)
 {
     loop_->assertInLoopThread();
@@ -1217,6 +1254,47 @@ ssize_t TcpConnectionImpl::writeInLoop(const char *buffer, size_t length)
         return sendTotalLen;
     }
 #endif
+}
+
+#ifdef USE_OPENSSL
+
+TcpConnectionImpl::TcpConnectionImpl(EventLoop *loop,
+                                     int socketfd,
+                                     const InetAddress &localAddr,
+                                     const InetAddress &peerAddr,
+                                     const std::shared_ptr<SSLContext> &ctxPtr,
+                                     bool isServer)
+    : loop_(loop),
+      ioChannelPtr_(new Channel(loop, socketfd)),
+      socketPtr_(new Socket(socketfd)),
+      localAddr_(localAddr),
+      peerAddr_(peerAddr),
+      isEncrypted_(true)
+{
+    LOG_TRACE << "new connection:" << peerAddr.toIpPort() << "->"
+              << localAddr.toIpPort();
+    ioChannelPtr_->setReadCallback(
+        std::bind(&TcpConnectionImpl::readCallback, this));
+    ioChannelPtr_->setWriteCallback(
+        std::bind(&TcpConnectionImpl::writeCallback, this));
+    ioChannelPtr_->setCloseCallback(
+        std::bind(&TcpConnectionImpl::handleClose, this));
+    ioChannelPtr_->setErrorCallback(
+        std::bind(&TcpConnectionImpl::handleError, this));
+    socketPtr_->setKeepAlive(true);
+    name_ = localAddr.toIpPort() + "--" + peerAddr.toIpPort();
+    sslEncryptionPtr_ = std::make_unique<SSLEncryption>();
+    sslEncryptionPtr_->sslPtr_ = std::make_unique<SSLConn>(ctxPtr->get());
+    sslEncryptionPtr_->isServer_ = isServer;
+    assert(sslEncryptionPtr_->sslPtr_);
+    auto r = SSL_set_fd(sslEncryptionPtr_->sslPtr_->get(), socketfd);
+    (void)r;
+    assert(r);
+    isEncrypted_ = true;
+    sslEncryptionPtr_->sendBufferPtr_ =
+        std::make_unique<std::array<char, 8192>>();
+}
+
 }
 
 #ifdef USE_OPENSSL
